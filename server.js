@@ -6,16 +6,16 @@ const app = express();
 const PORT = process.env.PORT || 443;
 
 app.use(cors());
-app.use(express.json()); // для парсинга JSON тела запросов
+app.use(express.json());
 
 // Хранилище активных комнат: { roomId: { password, createdAt } }
 const rooms = new Map();
 
-// Очистка старых комнат раз в час (можно и чаще)
+// Очистка старых комнат раз в час
 setInterval(() => {
   const now = Date.now();
   for (const [id, data] of rooms.entries()) {
-    if (now - data.createdAt > 24 * 60 * 60 * 1000) { // 24 часа
+    if (now - data.createdAt > 8 * 60 * 60 * 1000) { // 8 часов
       rooms.delete(id);
       console.log(`🗑️ Комната ${id} удалена (истек срок)`);
     }
@@ -30,9 +30,9 @@ app.post('/api/rooms', (req, res) => {
   if (!roomId || !password) {
     return res.status(400).json({ error: 'roomId and password required' });
   }
-  // Проверка длины и символов (можно дополнительно)
-  if (roomId.length < 1 || roomId.length > 10 || !/^[a-zA-Z0-9]+$/.test(roomId)) {
-    return res.status(400).json({ error: 'roomId must be 1-10 alphanumeric characters' });
+  // Ограничение длины, но любые символы (кроме пустых)
+  if (roomId.length < 1 || roomId.length > 20) {
+    return res.status(400).json({ error: 'roomId must be 1-20 characters' });
   }
   if (rooms.has(roomId)) {
     return res.status(409).json({ error: 'roomId already taken' });
@@ -52,8 +52,8 @@ app.post('/api/rooms/check', (req, res) => {
   if (!room) {
     return res.status(404).json({ error: 'room not found' });
   }
-  // Проверка срока действия (на всякий случай)
-  if (Date.now() - room.createdAt > 24 * 60 * 60 * 1000) {
+  // Проверка срока действия
+  if (Date.now() - room.createdAt > 8 * 60 * 60 * 1000) {
     rooms.delete(roomId);
     return res.status(410).json({ error: 'room expired' });
   }
@@ -74,7 +74,7 @@ const peerServer = ExpressPeerServer(server, {
 
 app.use('/', peerServer);
 
-// Опционально: пинг для предотвращения засыпания
+// Пинг для предотвращения засыпания
 app.get('/ping', (req, res) => {
   res.send('pong');
 });
