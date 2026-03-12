@@ -15,7 +15,6 @@ const peerServer = ExpressPeerServer(server, {
   allow_discovery: true,
 });
 
-// Монтируем PeerJS на корневой путь
 app.use('/', peerServer);
 
 app.get('/ping', (req, res) => {
@@ -30,7 +29,6 @@ peerServer.on('disconnect', (client) => {
   console.log('🔌 Клиент отключился:', client.getId());
 });
 
-// Пинг каждые 5 минут, чтобы бесплатный таймер не засыпал
 setInterval(() => {
   fetch(`http://localhost:${PORT}/ping`).catch(err => console.log('Ping error:', err.message));
 }, 300000);
