@@ -16,7 +16,7 @@ const io = new Server(server, {
   }
 });
 
-// Подключение к PostgreSQL
+// Подключение к PostgreSQL (ваша строка подключения)
 const pool = new Pool({
   connectionString: 'postgresql://chatx_db_wtlk_user:znr3oAy78EIqLR3FqXLHxYjnaqOYXT75@dpg-d6pna595pdvs739v2ou0-a/chatx_db_wtlk',
   ssl: {
@@ -35,7 +35,7 @@ async function initDB() {
         created_at TIMESTAMP NOT NULL DEFAULT NOW()
       )
     `);
-    // Таблица сообщений с добавленными полями для ответов
+    // Таблица сообщений с полями для ответов
     await pool.query(`
       CREATE TABLE IF NOT EXISTS messages (
         id SERIAL PRIMARY KEY,
@@ -64,6 +64,7 @@ async function initDB() {
 }
 initDB();
 
+// Хранилище активных пользователей в памяти
 const activeUsers = new Map(); // roomId -> Set of usernames
 
 // Очистка неактивных комнат (72 часа)
@@ -78,7 +79,7 @@ setInterval(async () => {
   } catch (err) {
     console.error('❌ Ошибка очистки:', err);
   }
-}, 60 * 60 * 1000);
+}, 60 * 60 * 1000); // раз в час
 
 io.on('connection', (socket) => {
   console.log('🔗 Клиент подключился:', socket.id);
@@ -166,7 +167,6 @@ io.on('connection', (socket) => {
       };
 
       socket.broadcast.to(roomId).emit('newMessage', newMessage);
-      // Отправляем обратно отправителю с ID сообщения
       socket.emit('messageSent', newMessage);
       console.log(`✅ Сообщение сохранено (id: ${messageId})`);
     } catch (err) {
