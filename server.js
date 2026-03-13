@@ -11,14 +11,14 @@ app.use(express.json());
 const server = http.createServer(app);
 const io = new Server(server, {
   cors: {
-    origin: '*', // в продакшене лучше указать конкретный домен
+    origin: '*', // в проде лучше указать конкретный домен клиента
     methods: ['GET', 'POST']
   }
 });
 
-// Подключение к PostgreSQL (замените на свои параметры)
+// Подключение к PostgreSQL через переменную окружения
 const pool = new Pool({
-  connectionString: process.env.DATABASE_URL || 'postgresql://user:password@localhost:5432/chatx',
+  connectionString: process.env.DATABASE_URL,
   ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false
 });
 
@@ -52,7 +52,7 @@ async function initDB() {
 }
 initDB().catch(console.error);
 
-// Хранилище активных пользователей в памяти (для быстрого доступа)
+// Хранилище активных пользователей в памяти
 const activeUsers = new Map(); // roomId -> Set of usernames
 
 // Очистка неактивных комнат (72 часа)
@@ -63,17 +63,15 @@ setInterval(async () => {
     );
     if (result.rowCount > 0) {
       console.log(`Cleaned up ${result.rowCount} inactive rooms`);
-      // Уведомить клиентов об удалении (опционально)
     }
   } catch (err) {
     console.error('Cleanup error:', err);
   }
-}, 60 * 60 * 1000); // раз в час
+}, 60 * 60 * 1000);
 
 io.on('connection', (socket) => {
   console.log('Client connected:', socket.id);
 
-  // --- Создание комнаты ---
   socket.on('createRoom', async ({ roomId }) => {
     try {
       const existing = await pool.query('SELECT id FROM rooms WHERE id = $1', [roomId]);
@@ -83,14 +81,12 @@ io.on('connection', (socket) => {
       }
       await pool.query('INSERT INTO rooms (id, last_active) VALUES ($1, NOW())', [roomId]);
       socket.emit('roomCreated', { roomId });
-      // Добавляем пользователя как активного? Пока не присоединился.
     } catch (err) {
       console.error(err);
       socket.emit('roomError', { message: 'Ошибка сервера' });
     }
   });
 
-  // --- Подключение к комнате ---
   socket.on('joinRoom', async ({ roomId, username }) => {
     try {
       const room = await pool.query('SELECT id FROM rooms WHERE id = $1', [roomId]);
@@ -98,16 +94,13 @@ io.on('connection', (socket) => {
         socket.emit('roomError', { message: 'Комната не существует' });
         return;
       }
-      // Обновляем last_active
       await pool.query('UPDATE rooms SET last_active = NOW() WHERE id = $1', [roomId]);
 
-      // Сохраняем пользователя в комнате (для истории)
       await pool.query(
         'INSERT INTO room_users (room_id, username) VALUES ($1, $2) ON CONFLICT DO NOTHING',
         [roomId, username]
       );
 
-      // Добавляем в активные
       if (!activeUsers.has(roomId)) {
         activeUsers.set(roomId, new Set());
       }
@@ -116,7 +109,6 @@ io.on('connection', (socket) => {
       socket.data.roomId = roomId;
       socket.data.username = username;
 
-      // Отправляем историю сообщений
       const messages = await pool.query(
         'SELECT sender, text, timestamp FROM messages WHERE room_id = $1 ORDER BY timestamp ASC',
         [roomId]
@@ -127,7 +119,6 @@ io.on('connection', (socket) => {
         userCount: activeUsers.get(roomId).size
       });
 
-      // Уведомляем всех в комнате о новом пользователе
       io.to(roomId).emit('userCount', { count: activeUsers.get(roomId).size });
     } catch (err) {
       console.error(err);
@@ -135,25 +126,20 @@ io.on('connection', (socket) => {
     }
   });
 
-  // --- Отправка сообщения ---
   socket.on('sendMessage', async ({ roomId, sender, text }) => {
     try {
-      // Сохраняем в БД
       await pool.query(
         'INSERT INTO messages (room_id, sender, text) VALUES ($1, $2, $3)',
         [roomId, sender, text]
       );
-      // Обновляем last_active комнаты
       await pool.query('UPDATE rooms SET last_active = NOW() WHERE id = $1', [roomId]);
 
-      // Рассылаем всем в комнате
       io.to(roomId).emit('newMessage', { roomId, sender, text });
     } catch (err) {
       console.error(err);
     }
   });
 
-  // --- Выход из комнаты ---
   socket.on('leaveRoom', ({ roomId }) => {
     if (roomId && socket.data.username) {
       const roomUsers = activeUsers.get(roomId);
@@ -169,10 +155,8 @@ io.on('connection', (socket) => {
     }
   });
 
-  // --- Получить список комнат для пользователя (по истории) ---
   socket.on('getRooms', async () => {
     try {
-      // Возвращаем все комнаты, отсортированные по last_active (сначала новые)
       const rooms = await pool.query(
         'SELECT id as "roomId", last_active as "lastActive" FROM rooms ORDER BY last_active DESC LIMIT 50'
       );
@@ -182,17 +166,15 @@ io.on('connection', (socket) => {
     }
   });
 
-  // --- Удаление комнаты пользователем ---
   socket.on('deleteRoom', async ({ roomId }) => {
     try {
       await pool.query('DELETE FROM rooms WHERE id = $1', [roomId]);
-      io.emit('roomDeleted', { roomId }); // уведомить всех клиентов
+      io.emit('roomDeleted', { roomId });
     } catch (err) {
       console.error(err);
     }
   });
 
-  // --- Отключение клиента ---
   socket.on('disconnect', () => {
     const { roomId, username } = socket.data;
     if (roomId && username) {
