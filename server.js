@@ -27,29 +27,49 @@ const pool = new Pool({
 // Создание таблиц при запуске
 async function initDB() {
   try {
+    // Пользователи
     await pool.query(`
-      CREATE TABLE IF NOT EXISTS rooms (
-        id VARCHAR(50) PRIMARY KEY,
-        last_active TIMESTAMP NOT NULL DEFAULT NOW(),
+      CREATE TABLE IF NOT EXISTS users (
+        username VARCHAR(50) PRIMARY KEY,
+        password VARCHAR(100) NOT NULL,
         created_at TIMESTAMP NOT NULL DEFAULT NOW()
       )
     `);
+    // Комнаты (личные и публичная)
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS rooms (
+        id VARCHAR(50) PRIMARY KEY,
+        name VARCHAR(100) NOT NULL,
+        password VARCHAR(100), -- NULL для публичной комнаты
+        type VARCHAR(20) NOT NULL DEFAULT 'private', -- 'public' или 'private'
+        created_at TIMESTAMP NOT NULL DEFAULT NOW()
+      )
+    `);
+    // Участники комнат и статус удаления
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS room_participants (
+        room_id VARCHAR(50) REFERENCES rooms(id) ON DELETE CASCADE,
+        username VARCHAR(50) REFERENCES users(username) ON DELETE CASCADE,
+        deleted BOOLEAN NOT NULL DEFAULT FALSE, -- пометил ли пользователь комнату как удалённую
+        joined_at TIMESTAMP NOT NULL DEFAULT NOW(),
+        PRIMARY KEY (room_id, username)
+      )
+    `);
+    // Сообщения (связь с комнатой)
     await pool.query(`
       CREATE TABLE IF NOT EXISTS messages (
         id SERIAL PRIMARY KEY,
         room_id VARCHAR(50) REFERENCES rooms(id) ON DELETE CASCADE,
-        sender VARCHAR(100) NOT NULL,
+        sender VARCHAR(50) REFERENCES users(username) ON DELETE SET NULL,
         text TEXT NOT NULL,
         timestamp TIMESTAMP NOT NULL DEFAULT NOW()
       )
     `);
+    // Создаём публичную комнату, если её нет
     await pool.query(`
-      CREATE TABLE IF NOT EXISTS room_users (
-        room_id VARCHAR(50) REFERENCES rooms(id) ON DELETE CASCADE,
-        username VARCHAR(100) NOT NULL,
-        joined_at TIMESTAMP NOT NULL DEFAULT NOW(),
-        PRIMARY KEY (room_id, username)
-      )
+      INSERT INTO rooms (id, name, password, type) 
+      VALUES ('public', 'Public Chat', NULL, 'public')
+      ON CONFLICT (id) DO NOTHING
     `);
     console.log('✅ База данных инициализирована');
   } catch (err) {
@@ -58,65 +78,208 @@ async function initDB() {
 }
 initDB();
 
-// Хранилище активных пользователей в памяти
+// Активные пользователи в памяти (для счётчиков)
 const activeUsers = new Map(); // roomId -> Set of usernames
 
-// Очистка неактивных комнат (72 часа)
-setInterval(async () => {
-  try {
-    const result = await pool.query(
-      `DELETE FROM rooms WHERE last_active < NOW() - INTERVAL '72 hours' RETURNING id`
-    );
-    if (result.rowCount > 0) {
-      console.log(`🧹 Удалено ${result.rowCount} неактивных комнат`);
-    }
-  } catch (err) {
-    console.error('❌ Ошибка очистки:', err);
+// --- API для аккаунтов ---
+app.post('/api/register', async (req, res) => {
+  const { username, password } = req.body;
+  if (!username || !password) {
+    return res.status(400).json({ error: 'Username and password required' });
   }
-}, 60 * 60 * 1000);
+  try {
+    const existing = await pool.query('SELECT username FROM users WHERE username = $1', [username]);
+    if (existing.rows.length > 0) {
+      return res.status(409).json({ error: 'Username already exists' });
+    }
+    await pool.query('INSERT INTO users (username, password) VALUES ($1, $2)', [username, password]);
+    res.json({ success: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
 
+app.post('/api/login', async (req, res) => {
+  const { username, password } = req.body;
+  if (!username || !password) {
+    return res.status(400).json({ error: 'Username and password required' });
+  }
+  try {
+    const user = await pool.query('SELECT password FROM users WHERE username = $1', [username]);
+    if (user.rows.length === 0) {
+      return res.status(401).json({ error: 'Invalid credentials' });
+    }
+    if (user.rows[0].password !== password) {
+      return res.status(401).json({ error: 'Invalid credentials' });
+    }
+    res.json({ success: true, username });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+app.post('/api/delete-account', async (req, res) => {
+  const { username, password } = req.body;
+  if (!username || !password) {
+    return res.status(400).json({ error: 'Username and password required' });
+  }
+  try {
+    const user = await pool.query('SELECT password FROM users WHERE username = $1', [username]);
+    if (user.rows.length === 0) {
+      return res.status(401).json({ error: 'Invalid credentials' });
+    }
+    if (user.rows[0].password !== password) {
+      return res.status(401).json({ error: 'Invalid credentials' });
+    }
+    // Удаляем пользователя (каскадно удалятся сообщения, участники)
+    await pool.query('DELETE FROM users WHERE username = $1', [username]);
+    res.json({ success: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// --- API для личных комнат ---
+app.post('/api/rooms/create', async (req, res) => {
+  const { roomId, roomName, password, creator } = req.body;
+  if (!roomId || !roomName || !password || !creator) {
+    return res.status(400).json({ error: 'Missing fields' });
+  }
+  try {
+    const existing = await pool.query('SELECT id FROM rooms WHERE id = $1', [roomId]);
+    if (existing.rows.length > 0) {
+      return res.status(409).json({ error: 'Room ID already exists' });
+    }
+    await pool.query(
+      'INSERT INTO rooms (id, name, password, type) VALUES ($1, $2, $3, $4)',
+      [roomId, roomName, password, 'private']
+    );
+    // Добавляем создателя как участника (не удалена)
+    await pool.query(
+      'INSERT INTO room_participants (room_id, username, deleted) VALUES ($1, $2, false)',
+      [roomId, creator]
+    );
+    res.json({ success: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+app.post('/api/rooms/check-password', async (req, res) => {
+  const { roomId, password } = req.body;
+  try {
+    const room = await pool.query('SELECT password FROM rooms WHERE id = $1 AND type = $2', [roomId, 'private']);
+    if (room.rows.length === 0) {
+      return res.status(404).json({ error: 'Room not found' });
+    }
+    if (room.rows[0].password !== password) {
+      return res.status(401).json({ error: 'Invalid password' });
+    }
+    res.json({ success: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+app.post('/api/rooms/join', async (req, res) => {
+  const { roomId, username } = req.body;
+  try {
+    // Добавляем участника, если ещё не участвует, и сбрасываем deleted
+    await pool.query(
+      `INSERT INTO room_participants (room_id, username, deleted) 
+       VALUES ($1, $2, false)
+       ON CONFLICT (room_id, username) 
+       DO UPDATE SET deleted = false`,
+      [roomId, username]
+    );
+    res.json({ success: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+app.post('/api/rooms/delete', async (req, res) => {
+  const { roomId, username } = req.body;
+  try {
+    // Помечаем комнату как удалённую для этого пользователя
+    await pool.query(
+      'UPDATE room_participants SET deleted = true WHERE room_id = $1 AND username = $2',
+      [roomId, username]
+    );
+    // Проверяем, все ли участники пометили комнату как удалённую
+    const remaining = await pool.query(
+      'SELECT COUNT(*) FROM room_participants WHERE room_id = $1 AND deleted = false',
+      [roomId]
+    );
+    if (parseInt(remaining.rows[0].count) === 0) {
+      // Никто не хочет видеть комнату – удаляем полностью
+      await pool.query('DELETE FROM rooms WHERE id = $1', [roomId]);
+    }
+    res.json({ success: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+app.get('/api/rooms/list/:username', async (req, res) => {
+  const { username } = req.params;
+  try {
+    const rooms = await pool.query(
+      `SELECT r.id, r.name, r.type 
+       FROM rooms r
+       JOIN room_participants p ON r.id = p.room_id
+       WHERE p.username = $1 AND p.deleted = false AND r.type = 'private'`,
+      [username]
+    );
+    res.json(rooms.rows);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// --- Socket.IO ---
 io.on('connection', (socket) => {
   console.log('🔗 Клиент подключился:', socket.id);
-
-  socket.on('createRoom', async ({ roomId }) => {
-    console.log(`📩 createRoom: ${roomId}`);
-    try {
-      const existing = await pool.query('SELECT id FROM rooms WHERE id = $1', [roomId]);
-      if (existing.rows.length > 0) {
-        socket.emit('roomError', { message: 'Комната с таким ID уже существует' });
-        return;
-      }
-      await pool.query('INSERT INTO rooms (id, last_active) VALUES ($1, NOW())', [roomId]);
-      socket.emit('roomCreated', { roomId });
-      console.log(`✅ Комната ${roomId} создана`);
-    } catch (err) {
-      console.error('❌ Ошибка createRoom:', err);
-      socket.emit('roomError', { message: 'Ошибка сервера при создании комнаты' });
-    }
-  });
 
   socket.on('joinRoom', async ({ roomId, username }) => {
     console.log(`📩 joinRoom: ${roomId}, пользователь ${username}`);
     try {
-      const room = await pool.query('SELECT id FROM rooms WHERE id = $1', [roomId]);
+      // Проверяем существование комнаты
+      const room = await pool.query('SELECT id, type FROM rooms WHERE id = $1', [roomId]);
       if (room.rows.length === 0) {
         socket.emit('roomError', { message: 'Комната не существует' });
         return;
       }
-      await pool.query('UPDATE rooms SET last_active = NOW() WHERE id = $1', [roomId]);
 
-      await pool.query(
-        'INSERT INTO room_users (room_id, username) VALUES ($1, $2) ON CONFLICT DO NOTHING',
-        [roomId, username]
-      );
+      // Для личных комнат проверяем, что пользователь участник
+      if (room.rows[0].type === 'private') {
+        const part = await pool.query(
+          'SELECT * FROM room_participants WHERE room_id = $1 AND username = $2',
+          [roomId, username]
+        );
+        if (part.rows.length === 0) {
+          socket.emit('roomError', { message: 'Вы не участник этой комнаты' });
+          return;
+        }
+      }
 
+      socket.join(roomId);
+      socket.data.roomId = roomId;
+      socket.data.username = username;
+
+      // Добавляем в активные
       if (!activeUsers.has(roomId)) {
         activeUsers.set(roomId, new Set());
       }
       activeUsers.get(roomId).add(username);
-      socket.join(roomId);
-      socket.data.roomId = roomId;
-      socket.data.username = username;
 
       // Отправляем историю сообщений
       const messages = await pool.query(
@@ -156,7 +319,6 @@ io.on('connection', (socket) => {
         timestamp: new Date().toISOString()
       };
 
-      // Отправляем сообщение всем в комнате, включая отправителя
       io.to(roomId).emit('newMessage', newMessage);
       console.log(`✅ Сообщение сохранено (id: ${messageId})`);
     } catch (err) {
@@ -178,30 +340,6 @@ io.on('connection', (socket) => {
       }
       socket.leave(roomId);
       console.log(`👋 Пользователь ${socket.data.username} покинул комнату ${roomId}`);
-    }
-  });
-
-  socket.on('getRooms', async () => {
-    console.log('📩 getRooms');
-    try {
-      const rooms = await pool.query(
-        'SELECT id as "roomId", last_active as "lastActive" FROM rooms ORDER BY last_active DESC LIMIT 50'
-      );
-      socket.emit('roomList', { rooms: rooms.rows });
-      console.log(`✅ Отправлено ${rooms.rows.length} комнат`);
-    } catch (err) {
-      console.error('❌ Ошибка getRooms:', err);
-    }
-  });
-
-  socket.on('deleteRoom', async ({ roomId }) => {
-    console.log(`📩 deleteRoom: ${roomId}`);
-    try {
-      await pool.query('DELETE FROM rooms WHERE id = $1', [roomId]);
-      io.emit('roomDeleted', { roomId });
-      console.log(`✅ Комната ${roomId} удалена`);
-    } catch (err) {
-      console.error('❌ Ошибка deleteRoom:', err);
     }
   });
 
