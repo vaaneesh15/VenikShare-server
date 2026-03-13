@@ -16,9 +16,9 @@ const io = new Server(server, {
   }
 });
 
-// Подключение к PostgreSQL (используем переменную окружения или резервную строку)
+// Подключение к PostgreSQL – используем переменную окружения или резервную строку с правильным именем базы
 const pool = new Pool({
-  connectionString: process.env.DATABASE_URL || 'postgresql://chatx_db_wtlk_user:znr3oAy78EIqLR3FqXLHxYjnaqOYXT75@dpg-d6pna595pdvs739v2ou0-a/chatx',
+  connectionString: process.env.DATABASE_URL || 'postgresql://chatx_db_wtlk_user:znr3oAy78EIqLR3FqXLHxYjnaqOYXT75@dpg-d6pna595pdvs739v2ou0-a/chatx_db',
   ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false
 });
 
