@@ -11,14 +11,14 @@ app.use(express.json());
 const server = http.createServer(app);
 const io = new Server(server, {
   cors: {
-    origin: '*', // в проде лучше указать конкретный домен клиента
+    origin: '*', // в продакшене можно указать домен клиента
     methods: ['GET', 'POST']
   }
 });
 
-// Подключение к PostgreSQL через переменную окружения
+// Подключение к PostgreSQL (используем твою строку)
 const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
+  connectionString: process.env.DATABASE_URL || 'postgresql://chatx_db_wtlk_user:znr3oAy78EIqLR3FqXLHxYjnaqOYXT75@dpg-d6pna595pdvs739v2ou0-a/chatx',
   ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false
 });
 
@@ -52,7 +52,7 @@ async function initDB() {
 }
 initDB().catch(console.error);
 
-// Хранилище активных пользователей в памяти
+// Хранилище активных пользователей в памяти (для быстрого доступа)
 const activeUsers = new Map(); // roomId -> Set of usernames
 
 // Очистка неактивных комнат (72 часа)
@@ -67,7 +67,7 @@ setInterval(async () => {
   } catch (err) {
     console.error('Cleanup error:', err);
   }
-}, 60 * 60 * 1000);
+}, 60 * 60 * 1000); // раз в час
 
 io.on('connection', (socket) => {
   console.log('Client connected:', socket.id);
@@ -94,13 +94,16 @@ io.on('connection', (socket) => {
         socket.emit('roomError', { message: 'Комната не существует' });
         return;
       }
+      // Обновляем last_active
       await pool.query('UPDATE rooms SET last_active = NOW() WHERE id = $1', [roomId]);
 
+      // Сохраняем пользователя в комнате (для истории)
       await pool.query(
         'INSERT INTO room_users (room_id, username) VALUES ($1, $2) ON CONFLICT DO NOTHING',
         [roomId, username]
       );
 
+      // Добавляем в активные
       if (!activeUsers.has(roomId)) {
         activeUsers.set(roomId, new Set());
       }
@@ -109,6 +112,7 @@ io.on('connection', (socket) => {
       socket.data.roomId = roomId;
       socket.data.username = username;
 
+      // Отправляем историю сообщений
       const messages = await pool.query(
         'SELECT sender, text, timestamp FROM messages WHERE room_id = $1 ORDER BY timestamp ASC',
         [roomId]
@@ -119,6 +123,7 @@ io.on('connection', (socket) => {
         userCount: activeUsers.get(roomId).size
       });
 
+      // Уведомляем всех в комнате о новом пользователе
       io.to(roomId).emit('userCount', { count: activeUsers.get(roomId).size });
     } catch (err) {
       console.error(err);
@@ -128,12 +133,15 @@ io.on('connection', (socket) => {
 
   socket.on('sendMessage', async ({ roomId, sender, text }) => {
     try {
+      // Сохраняем в БД
       await pool.query(
         'INSERT INTO messages (room_id, sender, text) VALUES ($1, $2, $3)',
         [roomId, sender, text]
       );
+      // Обновляем last_active комнаты
       await pool.query('UPDATE rooms SET last_active = NOW() WHERE id = $1', [roomId]);
 
+      // Рассылаем всем в комнате
       io.to(roomId).emit('newMessage', { roomId, sender, text });
     } catch (err) {
       console.error(err);
@@ -169,7 +177,7 @@ io.on('connection', (socket) => {
   socket.on('deleteRoom', async ({ roomId }) => {
     try {
       await pool.query('DELETE FROM rooms WHERE id = $1', [roomId]);
-      io.emit('roomDeleted', { roomId });
+      io.emit('roomDeleted', { roomId }); // уведомить всех клиентов
     } catch (err) {
       console.error(err);
     }
