@@ -11,16 +11,16 @@ app.use(express.json());
 const server = http.createServer(app);
 const io = new Server(server, {
   cors: {
-    origin: '*', // можно заменить на домен клиента позже
+    origin: '*',
     methods: ['GET', 'POST']
   }
 });
 
-// Подключение к PostgreSQL – строка прямо здесь, без переменных окружения
+// Подключение к PostgreSQL – строка прямо здесь
 const pool = new Pool({
   connectionString: 'postgresql://chatx_db_wtlk_user:znr3oAy78EIqLR3FqXLHxYjnaqOYXT75@dpg-d6pna595pdvs739v2ou0-a/chatx_db_wtlk',
   ssl: {
-    rejectUnauthorized: false // обязательно для Render
+    rejectUnauthorized: false
   }
 });
 
@@ -58,7 +58,6 @@ async function initDB() {
 }
 initDB();
 
-// Хранилище активных пользователей в памяти
 const activeUsers = new Map(); // roomId -> Set of usernames
 
 // Очистка неактивных комнат (72 часа)
@@ -73,7 +72,7 @@ setInterval(async () => {
   } catch (err) {
     console.error('❌ Ошибка очистки:', err);
   }
-}, 60 * 60 * 1000); // раз в час
+}, 60 * 60 * 1000);
 
 io.on('connection', (socket) => {
   console.log('🔗 Клиент подключился:', socket.id);
@@ -145,8 +144,8 @@ io.on('connection', (socket) => {
       );
       await pool.query('UPDATE rooms SET last_active = NOW() WHERE id = $1', [roomId]);
 
-socket.broadcast.to(roomId).emit('newMessage', { roomId, sender, text });
-      console.log(`✅ Сообщение сохранено и разослано в ${roomId}`);
+      socket.broadcast.to(roomId).emit('newMessage', { roomId, sender, text });
+      console.log(`✅ Сообщение сохранено и разослано в ${roomId} (кроме отправителя)`);
     } catch (err) {
       console.error('❌ Ошибка sendMessage:', err);
     }
