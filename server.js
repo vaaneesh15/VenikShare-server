@@ -11,15 +11,17 @@ app.use(express.json());
 const server = http.createServer(app);
 const io = new Server(server, {
   cors: {
-    origin: '*', // в проде лучше указать конкретный домен клиента
+    origin: '*', // можно заменить на домен клиента позже
     methods: ['GET', 'POST']
   }
 });
 
-// Подключение к PostgreSQL – используем переменную окружения или резервную строку с правильным именем базы
+// Подключение к PostgreSQL – строка прямо здесь, без переменных окружения
 const pool = new Pool({
-  connectionString: process.env.DATABASE_URL || 'postgresql://chatx_db_wtlk_user:znr3oAy78EIqLR3FqXLHxYjnaqOYXT75@dpg-d6pna595pdvs739v2ou0-a/chatx_db_wtlk',
-  ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false
+  connectionString: 'postgresql://chatx_db_wtlk_user:znr3oAy78EIqLR3FqXLHxYjnaqOYXT75@dpg-d6pna595pdvs739v2ou0-a/chatx_db_wtlk',
+  ssl: {
+    rejectUnauthorized: false // обязательно для Render
+  }
 });
 
 // Создание таблиц при запуске
@@ -101,16 +103,13 @@ io.on('connection', (socket) => {
         socket.emit('roomError', { message: 'Комната не существует' });
         return;
       }
-      // Обновляем last_active
       await pool.query('UPDATE rooms SET last_active = NOW() WHERE id = $1', [roomId]);
 
-      // Сохраняем пользователя в комнате (для истории)
       await pool.query(
         'INSERT INTO room_users (room_id, username) VALUES ($1, $2) ON CONFLICT DO NOTHING',
         [roomId, username]
       );
 
-      // Добавляем в активные
       if (!activeUsers.has(roomId)) {
         activeUsers.set(roomId, new Set());
       }
@@ -119,7 +118,6 @@ io.on('connection', (socket) => {
       socket.data.roomId = roomId;
       socket.data.username = username;
 
-      // Отправляем историю сообщений
       const messages = await pool.query(
         'SELECT sender, text, timestamp FROM messages WHERE room_id = $1 ORDER BY timestamp ASC',
         [roomId]
@@ -130,7 +128,6 @@ io.on('connection', (socket) => {
         userCount: activeUsers.get(roomId).size
       });
 
-      // Уведомляем всех в комнате о новом пользователе
       io.to(roomId).emit('userCount', { count: activeUsers.get(roomId).size });
       console.log(`✅ Пользователь ${username} присоединился к комнате ${roomId}, участников: ${activeUsers.get(roomId).size}`);
     } catch (err) {
