@@ -145,7 +145,7 @@ io.on('connection', (socket) => {
       );
       await pool.query('UPDATE rooms SET last_active = NOW() WHERE id = $1', [roomId]);
 
-      io.to(roomId).emit('newMessage', { roomId, sender, text });
+socket.broadcast.to(roomId).emit('newMessage', { roomId, sender, text });
       console.log(`✅ Сообщение сохранено и разослано в ${roomId}`);
     } catch (err) {
       console.error('❌ Ошибка sendMessage:', err);
