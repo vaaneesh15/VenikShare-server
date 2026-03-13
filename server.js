@@ -16,7 +16,7 @@ const io = new Server(server, {
   }
 });
 
-// Подключение к PostgreSQL (ваша строка подключения)
+// Подключение к PostgreSQL
 const pool = new Pool({
   connectionString: 'postgresql://chatx_db_wtlk_user:znr3oAy78EIqLR3FqXLHxYjnaqOYXT75@dpg-d6pna595pdvs739v2ou0-a/chatx_db_wtlk',
   ssl: {
@@ -27,7 +27,6 @@ const pool = new Pool({
 // Создание таблиц при запуске
 async function initDB() {
   try {
-    // Таблица комнат
     await pool.query(`
       CREATE TABLE IF NOT EXISTS rooms (
         id VARCHAR(50) PRIMARY KEY,
@@ -35,20 +34,15 @@ async function initDB() {
         created_at TIMESTAMP NOT NULL DEFAULT NOW()
       )
     `);
-    // Таблица сообщений с полями для ответов
     await pool.query(`
       CREATE TABLE IF NOT EXISTS messages (
         id SERIAL PRIMARY KEY,
         room_id VARCHAR(50) REFERENCES rooms(id) ON DELETE CASCADE,
         sender VARCHAR(100) NOT NULL,
         text TEXT NOT NULL,
-        reply_to_id INTEGER DEFAULT NULL,
-        reply_to_sender VARCHAR(100) DEFAULT NULL,
-        reply_to_text TEXT DEFAULT NULL,
         timestamp TIMESTAMP NOT NULL DEFAULT NOW()
       )
     `);
-    // Таблица пользователей комнат
     await pool.query(`
       CREATE TABLE IF NOT EXISTS room_users (
         room_id VARCHAR(50) REFERENCES rooms(id) ON DELETE CASCADE,
@@ -79,7 +73,7 @@ setInterval(async () => {
   } catch (err) {
     console.error('❌ Ошибка очистки:', err);
   }
-}, 60 * 60 * 1000); // раз в час
+}, 60 * 60 * 1000);
 
 io.on('connection', (socket) => {
   console.log('🔗 Клиент подключился:', socket.id);
@@ -124,10 +118,9 @@ io.on('connection', (socket) => {
       socket.data.roomId = roomId;
       socket.data.username = username;
 
-      // Получаем историю сообщений (включая поля для ответов)
+      // Отправляем историю сообщений
       const messages = await pool.query(
-        `SELECT id, sender, text, reply_to_id as "replyToId", reply_to_sender as "replyToSender", reply_to_text as "replyToText", timestamp
-         FROM messages WHERE room_id = $1 ORDER BY timestamp ASC`,
+        'SELECT id, sender, text, timestamp FROM messages WHERE room_id = $1 ORDER BY timestamp ASC',
         [roomId]
       );
       socket.emit('roomJoined', {
@@ -136,6 +129,7 @@ io.on('connection', (socket) => {
         userCount: activeUsers.get(roomId).size
       });
 
+      // Уведомляем всех в комнате о новом пользователе
       io.to(roomId).emit('userCount', { count: activeUsers.get(roomId).size });
       console.log(`✅ Пользователь ${username} присоединился к комнате ${roomId}, участников: ${activeUsers.get(roomId).size}`);
     } catch (err) {
@@ -144,13 +138,12 @@ io.on('connection', (socket) => {
     }
   });
 
-  socket.on('sendMessage', async ({ roomId, sender, text, replyToId, replyToSender, replyToText }) => {
+  socket.on('sendMessage', async ({ roomId, sender, text }) => {
     console.log(`📩 sendMessage в ${roomId} от ${sender}: ${text.substring(0,30)}...`);
     try {
       const result = await pool.query(
-        `INSERT INTO messages (room_id, sender, text, reply_to_id, reply_to_sender, reply_to_text)
-         VALUES ($1, $2, $3, $4, $5, $6) RETURNING id`,
-        [roomId, sender, text, replyToId || null, replyToSender || null, replyToText || null]
+        'INSERT INTO messages (room_id, sender, text) VALUES ($1, $2, $3) RETURNING id',
+        [roomId, sender, text]
       );
       const messageId = result.rows[0].id;
       await pool.query('UPDATE rooms SET last_active = NOW() WHERE id = $1', [roomId]);
@@ -160,14 +153,11 @@ io.on('connection', (socket) => {
         roomId,
         sender,
         text,
-        replyToId: replyToId || null,
-        replyToSender: replyToSender || null,
-        replyToText: replyToText || null,
         timestamp: new Date().toISOString()
       };
 
-      socket.broadcast.to(roomId).emit('newMessage', newMessage);
-      socket.emit('messageSent', newMessage);
+      // Отправляем сообщение всем в комнате, включая отправителя
+      io.to(roomId).emit('newMessage', newMessage);
       console.log(`✅ Сообщение сохранено (id: ${messageId})`);
     } catch (err) {
       console.error('❌ Ошибка sendMessage:', err);
