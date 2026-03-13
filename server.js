@@ -27,7 +27,7 @@ const pool = new Pool({
 // Создание таблиц при запуске
 async function initDB() {
   try {
-    // Пользователи
+    // Таблица пользователей
     await pool.query(`
       CREATE TABLE IF NOT EXISTS users (
         username VARCHAR(50) PRIMARY KEY,
@@ -35,27 +35,27 @@ async function initDB() {
         created_at TIMESTAMP NOT NULL DEFAULT NOW()
       )
     `);
-    // Комнаты (личные и публичная)
+    // Таблица комнат (личные и публичная)
     await pool.query(`
       CREATE TABLE IF NOT EXISTS rooms (
         id VARCHAR(50) PRIMARY KEY,
         name VARCHAR(100) NOT NULL,
         password VARCHAR(100), -- NULL для публичной комнаты
-        type VARCHAR(20) NOT NULL DEFAULT 'private', -- 'public' или 'private'
+        type VARCHAR(20) NOT NULL DEFAULT 'private',
         created_at TIMESTAMP NOT NULL DEFAULT NOW()
       )
     `);
-    // Участники комнат и статус удаления
+    // Таблица участников комнат и статус удаления
     await pool.query(`
       CREATE TABLE IF NOT EXISTS room_participants (
         room_id VARCHAR(50) REFERENCES rooms(id) ON DELETE CASCADE,
         username VARCHAR(50) REFERENCES users(username) ON DELETE CASCADE,
-        deleted BOOLEAN NOT NULL DEFAULT FALSE, -- пометил ли пользователь комнату как удалённую
+        deleted BOOLEAN NOT NULL DEFAULT FALSE,
         joined_at TIMESTAMP NOT NULL DEFAULT NOW(),
         PRIMARY KEY (room_id, username)
       )
     `);
-    // Сообщения (связь с комнатой)
+    // Таблица сообщений
     await pool.query(`
       CREATE TABLE IF NOT EXISTS messages (
         id SERIAL PRIMARY KEY,
@@ -120,6 +120,38 @@ app.post('/api/login', async (req, res) => {
   }
 });
 
+app.post('/api/change-username', async (req, res) => {
+  const { oldUsername, newUsername, password } = req.body;
+  if (!oldUsername || !newUsername || !password) {
+    return res.status(400).json({ error: 'Missing fields' });
+  }
+  try {
+    // Проверяем пароль
+    const user = await pool.query('SELECT password FROM users WHERE username = $1', [oldUsername]);
+    if (user.rows.length === 0) {
+      return res.status(401).json({ error: 'Invalid credentials' });
+    }
+    if (user.rows[0].password !== password) {
+      return res.status(401).json({ error: 'Invalid password' });
+    }
+    // Проверяем, что новое имя не занято
+    const existing = await pool.query('SELECT username FROM users WHERE username = $1', [newUsername]);
+    if (existing.rows.length > 0) {
+      return res.status(409).json({ error: 'Username already taken' });
+    }
+    // Обновляем имя в таблице users
+    await pool.query('UPDATE users SET username = $1 WHERE username = $2', [newUsername, oldUsername]);
+    // Обновляем все сообщения, где отправитель был старым именем
+    await pool.query('UPDATE messages SET sender = $1 WHERE sender = $2', [newUsername, oldUsername]);
+    // Обновляем участников комнат
+    await pool.query('UPDATE room_participants SET username = $1 WHERE username = $2', [newUsername, oldUsername]);
+    res.json({ success: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
 app.post('/api/delete-account', async (req, res) => {
   const { username, password } = req.body;
   if (!username || !password) {
@@ -133,7 +165,6 @@ app.post('/api/delete-account', async (req, res) => {
     if (user.rows[0].password !== password) {
       return res.status(401).json({ error: 'Invalid credentials' });
     }
-    // Удаляем пользователя (каскадно удалятся сообщения, участники)
     await pool.query('DELETE FROM users WHERE username = $1', [username]);
     res.json({ success: true });
   } catch (err) {
@@ -157,7 +188,6 @@ app.post('/api/rooms/create', async (req, res) => {
       'INSERT INTO rooms (id, name, password, type) VALUES ($1, $2, $3, $4)',
       [roomId, roomName, password, 'private']
     );
-    // Добавляем создателя как участника (не удалена)
     await pool.query(
       'INSERT INTO room_participants (room_id, username, deleted) VALUES ($1, $2, false)',
       [roomId, creator]
@@ -189,7 +219,6 @@ app.post('/api/rooms/check-password', async (req, res) => {
 app.post('/api/rooms/join', async (req, res) => {
   const { roomId, username } = req.body;
   try {
-    // Добавляем участника, если ещё не участвует, и сбрасываем deleted
     await pool.query(
       `INSERT INTO room_participants (room_id, username, deleted) 
        VALUES ($1, $2, false)
@@ -207,18 +236,15 @@ app.post('/api/rooms/join', async (req, res) => {
 app.post('/api/rooms/delete', async (req, res) => {
   const { roomId, username } = req.body;
   try {
-    // Помечаем комнату как удалённую для этого пользователя
     await pool.query(
       'UPDATE room_participants SET deleted = true WHERE room_id = $1 AND username = $2',
       [roomId, username]
     );
-    // Проверяем, все ли участники пометили комнату как удалённую
     const remaining = await pool.query(
       'SELECT COUNT(*) FROM room_participants WHERE room_id = $1 AND deleted = false',
       [roomId]
     );
     if (parseInt(remaining.rows[0].count) === 0) {
-      // Никто не хочет видеть комнату – удаляем полностью
       await pool.query('DELETE FROM rooms WHERE id = $1', [roomId]);
     }
     res.json({ success: true });
@@ -249,17 +275,32 @@ app.get('/api/rooms/list/:username', async (req, res) => {
 io.on('connection', (socket) => {
   console.log('🔗 Клиент подключился:', socket.id);
 
+  socket.on('createRoom', async ({ roomId }) => {
+    console.log(`📩 createRoom: ${roomId}`);
+    try {
+      const existing = await pool.query('SELECT id FROM rooms WHERE id = $1', [roomId]);
+      if (existing.rows.length > 0) {
+        socket.emit('roomError', { message: 'Комната с таким ID уже существует' });
+        return;
+      }
+      await pool.query('INSERT INTO rooms (id, last_active) VALUES ($1, NOW())', [roomId]);
+      socket.emit('roomCreated', { roomId });
+      console.log(`✅ Комната ${roomId} создана`);
+    } catch (err) {
+      console.error('❌ Ошибка createRoom:', err);
+      socket.emit('roomError', { message: 'Ошибка сервера при создании комнаты' });
+    }
+  });
+
   socket.on('joinRoom', async ({ roomId, username }) => {
     console.log(`📩 joinRoom: ${roomId}, пользователь ${username}`);
     try {
-      // Проверяем существование комнаты
       const room = await pool.query('SELECT id, type FROM rooms WHERE id = $1', [roomId]);
       if (room.rows.length === 0) {
         socket.emit('roomError', { message: 'Комната не существует' });
         return;
       }
 
-      // Для личных комнат проверяем, что пользователь участник
       if (room.rows[0].type === 'private') {
         const part = await pool.query(
           'SELECT * FROM room_participants WHERE room_id = $1 AND username = $2',
@@ -275,13 +316,11 @@ io.on('connection', (socket) => {
       socket.data.roomId = roomId;
       socket.data.username = username;
 
-      // Добавляем в активные
       if (!activeUsers.has(roomId)) {
         activeUsers.set(roomId, new Set());
       }
       activeUsers.get(roomId).add(username);
 
-      // Отправляем историю сообщений
       const messages = await pool.query(
         'SELECT id, sender, text, timestamp FROM messages WHERE room_id = $1 ORDER BY timestamp ASC',
         [roomId]
@@ -292,7 +331,6 @@ io.on('connection', (socket) => {
         userCount: activeUsers.get(roomId).size
       });
 
-      // Уведомляем всех в комнате о новом пользователе
       io.to(roomId).emit('userCount', { count: activeUsers.get(roomId).size });
       console.log(`✅ Пользователь ${username} присоединился к комнате ${roomId}, участников: ${activeUsers.get(roomId).size}`);
     } catch (err) {
@@ -309,8 +347,6 @@ io.on('connection', (socket) => {
         [roomId, sender, text]
       );
       const messageId = result.rows[0].id;
-      await pool.query('UPDATE rooms SET last_active = NOW() WHERE id = $1', [roomId]);
-
       const newMessage = {
         id: messageId,
         roomId,
@@ -318,7 +354,6 @@ io.on('connection', (socket) => {
         text,
         timestamp: new Date().toISOString()
       };
-
       io.to(roomId).emit('newMessage', newMessage);
       console.log(`✅ Сообщение сохранено (id: ${messageId})`);
     } catch (err) {
