@@ -6,7 +6,7 @@ const { Pool } = require('pg');
 
 const app = express();
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: '10mb' })); // для больших аватарок
 
 const server = http.createServer(app);
 const io = new Server(server, {
@@ -24,25 +24,15 @@ const pool = new Pool({
   }
 });
 
-// Тест подключения к базе данных
-async function testDB() {
-  try {
-    await pool.query('SELECT 1');
-    console.log('✅ Подключение к БД работает');
-  } catch (err) {
-    console.error('❌ Ошибка подключения к БД:', err);
-  }
-}
-testDB();
-
-// Инициализация таблиц (без invisible и admins)
+// Инициализация таблиц (без invisible, admins, last_seen)
 async function initDB() {
   try {
-    // Таблица пользователей (без поля invisible)
+    // Таблица пользователей с аватаркой
     await pool.query(`
       CREATE TABLE IF NOT EXISTS users (
         username VARCHAR(50) PRIMARY KEY,
         password VARCHAR(100) NOT NULL,
+        avatar TEXT,
         created_at TIMESTAMP NOT NULL DEFAULT NOW()
       )
     `);
@@ -84,6 +74,7 @@ async function initDB() {
         room_id VARCHAR(50) REFERENCES rooms(id) ON DELETE CASCADE,
         username VARCHAR(50) REFERENCES users(username) ON DELETE SET NULL,
         sender VARCHAR(50) NOT NULL,
+        avatar TEXT,
         text TEXT NOT NULL,
         timestamp TIMESTAMP NOT NULL DEFAULT NOW()
       )
@@ -148,11 +139,11 @@ app.post('/api/login', async (req, res) => {
     return res.status(400).json({ error: 'Имя и пароль обязательны' });
   }
   try {
-    const user = await pool.query('SELECT password FROM users WHERE username = $1', [username]);
+    const user = await pool.query('SELECT password, avatar FROM users WHERE username = $1', [username]);
     if (user.rows.length === 0 || user.rows[0].password !== password) {
       return res.status(401).json({ error: 'Неверное имя или пароль' });
     }
-    res.json({ success: true, username });
+    res.json({ success: true, username, avatar: user.rows[0].avatar });
   } catch (err) {
     console.error('Ошибка входа:', err);
     res.status(500).json({ error: 'Внутренняя ошибка сервера' });
@@ -223,6 +214,33 @@ app.post('/api/delete-account', async (req, res) => {
   }
 });
 
+// -------------------- API для аватарок --------------------
+app.post('/api/upload-avatar', async (req, res) => {
+  const { username, avatar } = req.body;
+  if (!username || !avatar) {
+    return res.status(400).json({ error: 'Не все поля заполнены' });
+  }
+  try {
+    await pool.query('UPDATE users SET avatar = $1 WHERE username = $2', [avatar, username]);
+    res.json({ success: true });
+  } catch (err) {
+    console.error('Ошибка загрузки аватара:', err);
+    res.status(500).json({ error: 'Внутренняя ошибка сервера' });
+  }
+});
+
+app.get('/api/avatar/:username', async (req, res) => {
+  const { username } = req.params;
+  try {
+    const user = await pool.query('SELECT avatar FROM users WHERE username = $1', [username]);
+    if (user.rows.length === 0) return res.status(404).json({ error: 'User not found' });
+    res.json({ avatar: user.rows[0].avatar });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
 // -------------------- API для настроек пользователя --------------------
 app.get('/api/user-settings', async (req, res) => {
   const { username } = req.query;
@@ -280,10 +298,18 @@ app.post('/api/mails/send', async (req, res) => {
     if (recipient.rows.length === 0) {
       return res.status(404).json({ error: 'Получатель не найден' });
     }
-    await pool.query(
-      'INSERT INTO mails (from_user, to_user, text) VALUES ($1, $2, $3)',
+    const result = await pool.query(
+      'INSERT INTO mails (from_user, to_user, text) VALUES ($1, $2, $3) RETURNING id',
       [from, to, text]
     );
+    const mailId = result.rows[0].id;
+    // Уведомляем получателя через сокет, если он онлайн
+    const recipientSockets = await io.fetchSockets(); // получаем все сокеты
+    recipientSockets.forEach(socket => {
+      if (socket.data.username === to) {
+        socket.emit('newMail', { id: mailId, from_user: from, text, timestamp: new Date() });
+      }
+    });
     res.json({ success: true });
   } catch (err) {
     console.error('Ошибка отправки письма:', err);
@@ -302,6 +328,20 @@ app.post('/api/mails/mark-read', async (req, res) => {
     res.json({ success: true });
   } catch (err) {
     console.error('Ошибка отметки писем:', err);
+    res.status(500).json({ error: 'Внутренняя ошибка сервера' });
+  }
+});
+
+app.delete('/api/mails/:id', async (req, res) => {
+  const { id } = req.params;
+  const { username } = req.query; // получатель
+  if (!username) return res.status(400).json({ error: 'Username required' });
+  try {
+    const result = await pool.query('DELETE FROM mails WHERE id = $1 AND to_user = $2 RETURNING id', [id, username]);
+    if (result.rows.length === 0) return res.status(404).json({ error: 'Письмо не найдено' });
+    res.json({ success: true });
+  } catch (err) {
+    console.error('Ошибка удаления письма:', err);
     res.status(500).json({ error: 'Внутренняя ошибка сервера' });
   }
 });
@@ -482,8 +522,13 @@ io.on('connection', (socket) => {
       }
       activeUsers.get(roomId).add(username);
 
+      // Загружаем историю сообщений, включая аватар отправителя
       const messages = await pool.query(
-        'SELECT id, sender, text, timestamp FROM messages WHERE room_id = $1 ORDER BY timestamp ASC',
+        `SELECT m.id, m.sender, m.text, m.timestamp, u.avatar 
+         FROM messages m
+         LEFT JOIN users u ON m.username = u.username
+         WHERE m.room_id = $1 
+         ORDER BY m.timestamp ASC`,
         [roomId]
       );
       socket.emit('roomJoined', {
@@ -503,15 +548,19 @@ io.on('connection', (socket) => {
   socket.on('sendMessage', async ({ roomId, sender, text }) => {
     console.log(`📩 sendMessage в ${roomId} от ${sender}: ${text.substring(0, 30)}...`);
     try {
+      // Получаем аватар отправителя
+      const user = await pool.query('SELECT avatar FROM users WHERE username = $1', [sender]);
+      const avatar = user.rows[0]?.avatar || null;
       const result = await pool.query(
-        'INSERT INTO messages (room_id, username, sender, text) VALUES ($1, $2, $3, $4) RETURNING id',
-        [roomId, sender, sender, text]
+        'INSERT INTO messages (room_id, username, sender, avatar, text) VALUES ($1, $2, $3, $4, $5) RETURNING id',
+        [roomId, sender, sender, avatar, text]
       );
       const messageId = result.rows[0].id;
       const newMessage = {
         id: messageId,
         roomId,
         sender,
+        avatar,
         text,
         timestamp: new Date().toISOString()
       };
