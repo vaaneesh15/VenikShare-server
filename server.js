@@ -16,21 +16,37 @@ const pool = new Pool({
   ssl: { rejectUnauthorized: false }
 });
 
-// Миграции для добавления недостающих колонок
+// Миграции для добавления недостающих колонок и таблиц
 async function migrateTables() {
   try {
+    // Проверка колонки avatar в users
     const avatarColumn = await pool.query(`SELECT column_name FROM information_schema.columns WHERE table_name='users' AND column_name='avatar'`);
     if (avatarColumn.rows.length === 0) await pool.query('ALTER TABLE users ADD COLUMN avatar TEXT');
 
+    // Проверка колонки avatar в messages
     const msgAvatarColumn = await pool.query(`SELECT column_name FROM information_schema.columns WHERE table_name='messages' AND column_name='avatar'`);
     if (msgAvatarColumn.rows.length === 0) await pool.query('ALTER TABLE messages ADD COLUMN avatar TEXT');
 
+    // Проверка колонки username в messages
     const usernameColumn = await pool.query(`SELECT column_name FROM information_schema.columns WHERE table_name='messages' AND column_name='username'`);
     if (usernameColumn.rows.length === 0) await pool.query('ALTER TABLE messages ADD COLUMN username VARCHAR(50) REFERENCES users(username) ON DELETE SET NULL');
 
+    // Проверка колонки is_read в mails
     const isReadColumn = await pool.query(`SELECT column_name FROM information_schema.columns WHERE table_name='mails' AND column_name='is_read'`);
     if (isReadColumn.rows.length === 0) await pool.query('ALTER TABLE mails ADD COLUMN is_read BOOLEAN NOT NULL DEFAULT FALSE');
-  } catch (err) { console.error('Ошибка миграции:', err); }
+
+    // Создание таблицы для реакций, если её нет
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS reactions (
+        id SERIAL PRIMARY KEY,
+        message_id INTEGER REFERENCES messages(id) ON DELETE CASCADE,
+        username VARCHAR(50) REFERENCES users(username) ON DELETE CASCADE,
+        emoji VARCHAR(10) NOT NULL,
+        UNIQUE(message_id, username)
+      )
+    `);
+    console.log('✅ Таблица реакций проверена/создана');
+  } catch (err) { console.error('❌ Ошибка миграции:', err); }
 }
 
 async function initDB() {
@@ -41,6 +57,7 @@ async function initDB() {
     await pool.query(`CREATE TABLE IF NOT EXISTS room_participants (room_id VARCHAR(50) REFERENCES rooms(id) ON DELETE CASCADE, username VARCHAR(50) REFERENCES users(username) ON DELETE CASCADE, deleted BOOLEAN NOT NULL DEFAULT FALSE, joined_at TIMESTAMP NOT NULL DEFAULT NOW(), PRIMARY KEY (room_id, username))`);
     await pool.query(`CREATE TABLE IF NOT EXISTS messages (id SERIAL PRIMARY KEY, room_id VARCHAR(50) REFERENCES rooms(id) ON DELETE CASCADE, username VARCHAR(50) REFERENCES users(username) ON DELETE SET NULL, sender VARCHAR(50) NOT NULL, avatar TEXT, text TEXT NOT NULL, timestamp TIMESTAMP NOT NULL DEFAULT NOW())`);
     await pool.query(`CREATE TABLE IF NOT EXISTS mails (id SERIAL PRIMARY KEY, from_user VARCHAR(50) REFERENCES users(username) ON DELETE CASCADE, to_user VARCHAR(50) REFERENCES users(username) ON DELETE CASCADE, text TEXT NOT NULL, timestamp TIMESTAMP NOT NULL DEFAULT NOW(), is_read BOOLEAN NOT NULL DEFAULT FALSE)`);
+    await pool.query(`CREATE TABLE IF NOT EXISTS reactions (id SERIAL PRIMARY KEY, message_id INTEGER REFERENCES messages(id) ON DELETE CASCADE, username VARCHAR(50) REFERENCES users(username) ON DELETE CASCADE, emoji VARCHAR(10) NOT NULL, UNIQUE(message_id, username))`);
     await pool.query(`INSERT INTO rooms (id, name, password, type) VALUES ('public', 'Public Chat', NULL, 'public') ON CONFLICT (id) DO NOTHING`);
     console.log('✅ База инициализирована');
     await migrateTables();
@@ -285,6 +302,57 @@ app.get('/api/rooms/participants/public', (req, res) => {
   res.json(users ? Array.from(users) : []);
 });
 
+// -------------------- API для реакций --------------------
+// Получить все реакции для сообщения
+app.get('/api/messages/:messageId/reactions', async (req, res) => {
+  const { messageId } = req.params;
+  try {
+    const reactions = await pool.query(
+      'SELECT username, emoji FROM reactions WHERE message_id = $1',
+      [messageId]
+    );
+    res.json(reactions.rows);
+  } catch (err) { console.error(err); res.status(500).json({ error: 'Server error' }); }
+});
+
+// Добавить/удалить реакцию (toggle)
+app.post('/api/messages/:messageId/react', async (req, res) => {
+  const { messageId } = req.params;
+  const { username, emoji } = req.body;
+  if (!username || !emoji) return res.status(400).json({ error: 'Missing fields' });
+  try {
+    // Проверяем, существует ли уже такая реакция от этого пользователя
+    const existing = await pool.query(
+      'SELECT id FROM reactions WHERE message_id = $1 AND username = $2',
+      [messageId, username]
+    );
+    if (existing.rows.length > 0) {
+      // Если уже есть, удаляем (независимо от эмодзи – пользователь может иметь только одну реакцию)
+      await pool.query('DELETE FROM reactions WHERE message_id = $1 AND username = $2', [messageId, username]);
+      res.json({ action: 'removed' });
+    } else {
+      // Добавляем
+      await pool.query(
+        'INSERT INTO reactions (message_id, username, emoji) VALUES ($1, $2, $3)',
+        [messageId, username, emoji]
+      );
+      res.json({ action: 'added' });
+    }
+  } catch (err) { console.error(err); res.status(500).json({ error: 'Server error' }); }
+});
+
+// Получить список пользователей, поставивших конкретную реакцию на сообщение
+app.get('/api/messages/:messageId/reactions/:emoji/users', async (req, res) => {
+  const { messageId, emoji } = req.params;
+  try {
+    const users = await pool.query(
+      'SELECT username FROM reactions WHERE message_id = $1 AND emoji = $2',
+      [messageId, emoji]
+    );
+    res.json(users.rows.map(r => r.username));
+  } catch (err) { console.error(err); res.status(500).json({ error: 'Server error' }); }
+});
+
 // -------------------- Socket.IO --------------------
 io.on('connection', (socket) => {
   console.log('🔗 Клиент подключился:', socket.id);
@@ -310,6 +378,9 @@ io.on('connection', (socket) => {
          ORDER BY m.timestamp ASC`,
         [roomId]
       );
+      // Загружаем реакции для этих сообщений (можно отдельно, но для простоты вернём сразу)
+      // Однако реакции лучше загружать отдельно, чтобы не усложнять. Но можно и так.
+      // Пока оставим как есть, а реакции будут запрашиваться при открытии контекстного меню.
       socket.emit('roomJoined', { roomId, messages: messages.rows, userCount: activeUsers.get(roomId).size });
       io.to(roomId).emit('userCount', { count: activeUsers.get(roomId).size });
     } catch (err) { console.error(err); socket.emit('roomError', { message: 'Ошибка сервера: ' + err.message }); }
