@@ -24,10 +24,62 @@ const pool = new Pool({
   }
 });
 
-// Инициализация таблиц (без invisible, admins, last_seen)
+// Функция для проверки и добавления колонок (миграция)
+async function migrateTables() {
+  try {
+    // Проверяем, есть ли колонка avatar в таблице users
+    const avatarColumn = await pool.query(`
+      SELECT column_name 
+      FROM information_schema.columns 
+      WHERE table_name='users' AND column_name='avatar'
+    `);
+    if (avatarColumn.rows.length === 0) {
+      await pool.query('ALTER TABLE users ADD COLUMN avatar TEXT');
+      console.log('✅ Добавлена колонка avatar в users');
+    }
+
+    // Проверяем, есть ли колонка avatar в таблице messages
+    const msgAvatarColumn = await pool.query(`
+      SELECT column_name 
+      FROM information_schema.columns 
+      WHERE table_name='messages' AND column_name='avatar'
+    `);
+    if (msgAvatarColumn.rows.length === 0) {
+      await pool.query('ALTER TABLE messages ADD COLUMN avatar TEXT');
+      console.log('✅ Добавлена колонка avatar в messages');
+    }
+
+    // Проверяем, есть ли колонка username в messages (должна быть, но на всякий случай)
+    const usernameColumn = await pool.query(`
+      SELECT column_name 
+      FROM information_schema.columns 
+      WHERE table_name='messages' AND column_name='username'
+    `);
+    if (usernameColumn.rows.length === 0) {
+      await pool.query('ALTER TABLE messages ADD COLUMN username VARCHAR(50) REFERENCES users(username) ON DELETE SET NULL');
+      console.log('✅ Добавлена колонка username в messages');
+    }
+
+    // Проверяем, есть ли колонка is_read в mails
+    const isReadColumn = await pool.query(`
+      SELECT column_name 
+      FROM information_schema.columns 
+      WHERE table_name='mails' AND column_name='is_read'
+    `);
+    if (isReadColumn.rows.length === 0) {
+      await pool.query('ALTER TABLE mails ADD COLUMN is_read BOOLEAN NOT NULL DEFAULT FALSE');
+      console.log('✅ Добавлена колонка is_read в mails');
+    }
+
+  } catch (err) {
+    console.error('❌ Ошибка миграции:', err);
+  }
+}
+
+// Инициализация таблиц (создание, если их нет)
 async function initDB() {
   try {
-    // Таблица пользователей с аватаркой
+    // Таблица пользователей
     await pool.query(`
       CREATE TABLE IF NOT EXISTS users (
         username VARCHAR(50) PRIMARY KEY,
@@ -100,6 +152,10 @@ async function initDB() {
     `);
 
     console.log('✅ База данных успешно инициализирована');
+
+    // Запускаем миграции для добавления отсутствующих колонок
+    await migrateTables();
+
   } catch (err) {
     console.error('❌ Ошибка инициализации БД:', err);
   }
