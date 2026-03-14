@@ -251,13 +251,12 @@ app.get('/api/rooms/info/:roomId', async (req, res) => {
   } catch (err) { console.error(err); res.status(500).json({ error: 'Ошибка сервера' }); }
 });
 
-// **НОВЫЙ ЭНДПОИНТ: получить сообщения комнаты (без присоединения)**
+// Эндпоинт для получения сообщений комнаты (без присоединения)
 app.get('/api/rooms/:roomId/messages', async (req, res) => {
   const { roomId } = req.params;
   const { username } = req.query;
   if (!username) return res.status(400).json({ error: 'Username required' });
   try {
-    // Проверяем, является ли пользователь участником комнаты (для приватных)
     const room = await pool.query('SELECT type FROM rooms WHERE id = $1', [roomId]);
     if (room.rows.length === 0) return res.status(404).json({ error: 'Room not found' });
     if (room.rows[0].type === 'private') {
@@ -289,6 +288,7 @@ app.get('/api/rooms/participants/public', (req, res) => {
 // -------------------- Socket.IO --------------------
 io.on('connection', (socket) => {
   console.log('🔗 Клиент подключился:', socket.id);
+
   socket.on('joinRoom', async ({ roomId, username }) => {
     try {
       const room = await pool.query('SELECT id, type FROM rooms WHERE id = $1', [roomId]);
@@ -302,7 +302,14 @@ io.on('connection', (socket) => {
       socket.data.username = username;
       if (!activeUsers.has(roomId)) activeUsers.set(roomId, new Set());
       activeUsers.get(roomId).add(username);
-      const messages = await pool.query(`SELECT m.id, m.sender, m.text, m.timestamp, u.avatar FROM messages m LEFT JOIN users u ON m.username = u.username WHERE m.room_id = $1 ORDER BY m.timestamp ASC`, [roomId]);
+      const messages = await pool.query(
+        `SELECT m.id, m.sender, m.text, m.timestamp, u.avatar 
+         FROM messages m
+         LEFT JOIN users u ON m.username = u.username
+         WHERE m.room_id = $1 
+         ORDER BY m.timestamp ASC`,
+        [roomId]
+      );
       socket.emit('roomJoined', { roomId, messages: messages.rows, userCount: activeUsers.get(roomId).size });
       io.to(roomId).emit('userCount', { count: activeUsers.get(roomId).size });
     } catch (err) { console.error(err); socket.emit('roomError', { message: 'Ошибка сервера: ' + err.message }); }
