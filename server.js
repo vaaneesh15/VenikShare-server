@@ -24,10 +24,21 @@ const pool = new Pool({
   }
 });
 
-// Секретная фраза для получения админки (не используется в текущей версии, но оставлена)
+// Секретная фраза для получения админки (не используется в текущей версии клиента)
 const ADMIN_SECRET = 'blesterModGive3319_boshshsh';
 
-// Инициализация таблиц базы данных
+// Тест подключения к базе данных
+async function testDB() {
+  try {
+    await pool.query('SELECT 1');
+    console.log('✅ Подключение к БД работает');
+  } catch (err) {
+    console.error('❌ Ошибка подключения к БД:', err);
+  }
+}
+testDB();
+
+// Инициализация таблиц
 async function initDB() {
   try {
     // Таблица пользователей
@@ -470,6 +481,97 @@ app.get('/api/rooms/participants/public', (req, res) => {
   res.json(users ? Array.from(users) : []);
 });
 
+// -------------------- API для админки (не используются в текущем клиенте) --------------------
+app.get('/api/user/isadmin', async (req, res) => {
+  const { username } = req.query;
+  if (!username) return res.status(400).json({ error: 'Username required' });
+  try {
+    const admin = await isAdmin(username);
+    res.json({ admin });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+app.get('/api/admin/list', async (req, res) => {
+  const { requester } = req.query;
+  if (!requester) return res.status(400).json({ error: 'Requester required' });
+  try {
+    if (!await isAdmin(requester)) return res.status(403).json({ error: 'Forbidden' });
+    const admins = await pool.query('SELECT username FROM admins');
+    res.json(admins.rows.map(row => row.username));
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+app.post('/api/admin/add', async (req, res) => {
+  const { requester, username } = req.body;
+  if (!requester || !username) return res.status(400).json({ error: 'Missing fields' });
+  try {
+    if (!await isAdmin(requester)) return res.status(403).json({ error: 'Forbidden' });
+    await pool.query('INSERT INTO admins (username) VALUES ($1) ON CONFLICT DO NOTHING', [username]);
+    res.json({ success: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+app.post('/api/admin/remove', async (req, res) => {
+  const { requester, username } = req.body;
+  if (!requester || !username) return res.status(400).json({ error: 'Missing fields' });
+  try {
+    if (!await isAdmin(requester)) return res.status(403).json({ error: 'Forbidden' });
+    await pool.query('DELETE FROM admins WHERE username = $1', [username]);
+    res.json({ success: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+app.post('/api/admin/grant', async (req, res) => {
+  const { username, secret } = req.body;
+  if (!username || !secret) return res.status(400).json({ error: 'Missing fields' });
+  if (secret !== ADMIN_SECRET) return res.status(403).json({ error: 'Invalid secret' });
+  try {
+    await pool.query('INSERT INTO admins (username) VALUES ($1) ON CONFLICT DO NOTHING', [username]);
+    res.json({ success: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// -------------------- API для невидимки --------------------
+app.get('/api/user/invisible', async (req, res) => {
+  const { username } = req.query;
+  if (!username) return res.status(400).json({ error: 'Username required' });
+  try {
+    const user = await pool.query('SELECT invisible FROM users WHERE username = $1', [username]);
+    if (user.rows.length === 0) return res.status(404).json({ error: 'User not found' });
+    res.json({ invisible: user.rows[0].invisible });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+app.post('/api/user/invisible', async (req, res) => {
+  const { username, invisible } = req.body;
+  if (!username || typeof invisible !== 'boolean') return res.status(400).json({ error: 'Invalid data' });
+  try {
+    await pool.query('UPDATE users SET invisible = $1 WHERE username = $2', [invisible, username]);
+    res.json({ success: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
 // -------------------- Socket.IO --------------------
 io.on('connection', (socket) => {
   console.log('🔗 Клиент подключился:', socket.id);
@@ -523,8 +625,8 @@ io.on('connection', (socket) => {
       io.to(roomId).emit('userCount', { count: activeUsers.get(roomId).size });
       console.log(`✅ Пользователь ${username} присоединился к комнате ${roomId}, участников: ${activeUsers.get(roomId).size}`);
     } catch (err) {
-      console.error('❌ Ошибка joinRoom:', err);
-      socket.emit('roomError', { message: 'Ошибка сервера при подключении' });
+      console.error('❌ Детальная ошибка joinRoom:', err);
+      socket.emit('roomError', { message: 'Ошибка сервера при подключении: ' + err.message });
     }
   });
 
