@@ -1,501 +1,69 @@
-const express = require('express');
-const http = require('http');
-const { Server } = require('socket.io');
-const cors = require('cors');
-const { Pool } = require('pg');
+// После currentUser добавим
+let currentUserId = null;
+let currentUserIsAdmin = false;
 
-const app = express();
-app.use(cors());
-app.use(express.json());
-
-const server = http.createServer(app);
-const io = new Server(server, {
-  cors: {
-    origin: '*',
-    methods: ['GET', 'POST']
-  }
-});
-
-// Подключение к PostgreSQL
-const pool = new Pool({
-  connectionString: 'postgresql://chatx_db_wtlk_user:znr3oAy78EIqLR3FqXLHxYjnaqOYXT75@dpg-d6pna595pdvs739v2ou0-a/chatx_db_wtlk',
-  ssl: {
-    rejectUnauthorized: false
-  }
-});
-
-// Инициализация таблиц
-async function initDB() {
+// Функция проверки админа
+async function checkIsAdmin(username) {
   try {
-    // Таблица пользователей
-    await pool.query(`
-      CREATE TABLE IF NOT EXISTS users (
-        username VARCHAR(50) PRIMARY KEY,
-        password VARCHAR(100) NOT NULL,
-        created_at TIMESTAMP NOT NULL DEFAULT NOW()
-      )
-    `);
-
-    // Таблица настроек пользователей (JSONB)
-    await pool.query(`
-      CREATE TABLE IF NOT EXISTS user_settings (
-        username VARCHAR(50) PRIMARY KEY REFERENCES users(username) ON DELETE CASCADE,
-        settings JSONB NOT NULL DEFAULT '{}'
-      )
-    `);
-
-    // Таблица комнат
-    await pool.query(`
-      CREATE TABLE IF NOT EXISTS rooms (
-        id VARCHAR(50) PRIMARY KEY,
-        name VARCHAR(100) NOT NULL,
-        password VARCHAR(100), -- NULL для публичной комнаты
-        type VARCHAR(20) NOT NULL DEFAULT 'private',
-        created_at TIMESTAMP NOT NULL DEFAULT NOW()
-      )
-    `);
-
-    // Таблица участников комнат
-    await pool.query(`
-      CREATE TABLE IF NOT EXISTS room_participants (
-        room_id VARCHAR(50) REFERENCES rooms(id) ON DELETE CASCADE,
-        username VARCHAR(50) REFERENCES users(username) ON DELETE CASCADE,
-        deleted BOOLEAN NOT NULL DEFAULT FALSE,
-        joined_at TIMESTAMP NOT NULL DEFAULT NOW(),
-        PRIMARY KEY (room_id, username)
-      )
-    `);
-
-    // Таблица сообщений
-    await pool.query(`
-      CREATE TABLE IF NOT EXISTS messages (
-        id SERIAL PRIMARY KEY,
-        room_id VARCHAR(50) REFERENCES rooms(id) ON DELETE CASCADE,
-        sender VARCHAR(50) REFERENCES users(username) ON DELETE SET NULL,
-        text TEXT NOT NULL,
-        timestamp TIMESTAMP NOT NULL DEFAULT NOW()
-      )
-    `);
-
-    // Создаём публичную комнату, если её нет
-    await pool.query(`
-      INSERT INTO rooms (id, name, password, type) 
-      VALUES ('public', 'Public Chat', NULL, 'public')
-      ON CONFLICT (id) DO NOTHING
-    `);
-
-    console.log('✅ База данных инициализирована');
-  } catch (err) {
-    console.error('❌ Ошибка инициализации БД:', err);
+    const res = await fetch(API_BASE + '/api/user/isadmin?username=' + username);
+    const data = await res.json();
+    return data.admin;
+  } catch {
+    return false;
   }
 }
-initDB();
 
-// Хранилище активных пользователей (для счётчиков онлайн)
-const activeUsers = new Map(); // roomId -> Set of usernames
-
-// ---------- API для аккаунтов ----------
-app.post('/api/register', async (req, res) => {
-  const { username, password } = req.body;
-  if (!username || !password) {
-    return res.status(400).json({ error: 'Username and password required' });
-  }
+// Функция получения своего ID
+async function fetchMyId(username) {
   try {
-    const existing = await pool.query('SELECT username FROM users WHERE username = $1', [username]);
-    if (existing.rows.length > 0) {
-      return res.status(409).json({ error: 'Username already exists' });
-    }
-    await pool.query('INSERT INTO users (username, password) VALUES ($1, $2)', [username, password]);
-    // Создаём запись настроек по умолчанию
-    await pool.query(
-      'INSERT INTO user_settings (username, settings) VALUES ($1, $2)',
-      [username, JSON.stringify({ requirePassword: false, passwordTimeout: 0 })]
-    );
-    res.json({ success: true });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: 'Server error' });
+    const res = await fetch(API_BASE + '/api/user/id/' + username + '?requester=' + username);
+    const data = await res.json();
+    return data.id;
+  } catch {
+    return null;
   }
-});
+}
 
-app.post('/api/login', async (req, res) => {
-  const { username, password } = req.body;
-  if (!username || !password) {
-    return res.status(400).json({ error: 'Username and password required' });
-  }
-  try {
-    const user = await pool.query('SELECT password FROM users WHERE username = $1', [username]);
-    if (user.rows.length === 0) {
-      return res.status(401).json({ error: 'Invalid credentials' });
-    }
-    if (user.rows[0].password !== password) {
-      return res.status(401).json({ error: 'Invalid credentials' });
-    }
-    res.json({ success: true, username });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: 'Server error' });
-  }
-});
+// В login после успешного входа
+currentUser = { username };
+const userData = await res.json(); // предположим, сервер возвращает userId
+currentUserId = userData.userId;
+currentUserIsAdmin = await checkIsAdmin(username);
+// сохраняем в localStorage
+localStorage.setItem('chatxUser', JSON.stringify({ username, userId: currentUserId, isAdmin: currentUserIsAdmin }));
 
-app.post('/api/change-password', async (req, res) => {
-  const { username, oldPassword, newPassword } = req.body;
-  if (!username || !oldPassword || !newPassword) {
-    return res.status(400).json({ error: 'Missing fields' });
-  }
-  try {
-    const user = await pool.query('SELECT password FROM users WHERE username = $1', [username]);
-    if (user.rows.length === 0) {
-      return res.status(401).json({ error: 'User not found' });
-    }
-    if (user.rows[0].password !== oldPassword) {
-      return res.status(401).json({ error: 'Invalid old password' });
-    }
-    await pool.query('UPDATE users SET password = $1 WHERE username = $2', [newPassword, username]);
-    res.json({ success: true });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: 'Server error' });
-  }
-});
+// При загрузке из localStorage
+const saved = JSON.parse(localStorage.getItem('chatxUser'));
+if (saved) {
+  currentUser = { username: saved.username };
+  currentUserId = saved.userId;
+  currentUserIsAdmin = saved.isAdmin;
+}
 
-app.post('/api/change-username', async (req, res) => {
-  const { oldUsername, newUsername, password } = req.body;
-  if (!oldUsername || !newUsername || !password) {
-    return res.status(400).json({ error: 'Missing fields' });
-  }
-  try {
-    const user = await pool.query('SELECT password FROM users WHERE username = $1', [oldUsername]);
-    if (user.rows.length === 0 || user.rows[0].password !== password) {
-      return res.status(401).json({ error: 'Invalid credentials' });
-    }
-    const existing = await pool.query('SELECT username FROM users WHERE username = $1', [newUsername]);
-    if (existing.rows.length > 0) {
-      return res.status(409).json({ error: 'Username already taken' });
-    }
-    await pool.query('UPDATE users SET username = $1 WHERE username = $2', [newUsername, oldUsername]);
-    await pool.query('UPDATE messages SET sender = $1 WHERE sender = $2', [newUsername, oldUsername]);
-    await pool.query('UPDATE room_participants SET username = $1 WHERE username = $2', [newUsername, oldUsername]);
-    await pool.query('UPDATE user_settings SET username = $1 WHERE username = $2', [newUsername, oldUsername]);
-    res.json({ success: true });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: 'Server error' });
-  }
-});
+// В профиле отображаем ID
+// добавим элемент в HTML профиля
+<div style="margin-bottom: 8px;">
+  <span style="color: var(--text-primary);">ID: </span>
+  <span style="color: var(--accent);" id="profile-user-id"></span>
+</div>
 
-app.post('/api/delete-account', async (req, res) => {
-  const { username, password } = req.body;
-  if (!username || !password) {
-    return res.status(400).json({ error: 'Username and password required' });
-  }
-  try {
-    const user = await pool.query('SELECT password FROM users WHERE username = $1', [username]);
-    if (user.rows.length === 0 || user.rows[0].password !== password) {
-      return res.status(401).json({ error: 'Invalid credentials' });
-    }
-    await pool.query('DELETE FROM users WHERE username = $1', [username]);
-    res.json({ success: true });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: 'Server error' });
-  }
-});
+// И заполняем
+document.getElementById('profile-user-id').textContent = currentUserId;
 
-// ---------- API для настроек пользователя ----------
-app.get('/api/user-settings', async (req, res) => {
-  const { username } = req.query;
-  if (!username) return res.status(400).json({ error: 'Username required' });
-  try {
-    const settings = await pool.query('SELECT settings FROM user_settings WHERE username = $1', [username]);
-    if (settings.rows.length === 0) {
-      // Если нет записи, создаём с настройками по умолчанию
-      const defaultSettings = { requirePassword: false, passwordTimeout: 0 };
-      await pool.query('INSERT INTO user_settings (username, settings) VALUES ($1, $2)', [username, JSON.stringify(defaultSettings)]);
-      return res.json(defaultSettings);
-    }
-    res.json(settings.rows[0].settings);
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: 'Server error' });
-  }
-});
-
-app.post('/api/user-settings', async (req, res) => {
-  const { username, settings } = req.body;
-  if (!username || !settings) return res.status(400).json({ error: 'Missing fields' });
-  try {
-    await pool.query(
-      'INSERT INTO user_settings (username, settings) VALUES ($1, $2) ON CONFLICT (username) DO UPDATE SET settings = $2',
-      [username, JSON.stringify(settings)]
-    );
-    res.json({ success: true });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: 'Server error' });
-  }
-});
-
-// ---------- API для личных комнат ----------
-app.post('/api/rooms/create', async (req, res) => {
-  const { roomId, roomName, password, creator } = req.body;
-  if (!roomId || !roomName || !password || !creator) {
-    return res.status(400).json({ error: 'Missing fields' });
-  }
-  try {
-    const existing = await pool.query('SELECT id FROM rooms WHERE id = $1', [roomId]);
-    if (existing.rows.length > 0) {
-      return res.status(409).json({ error: 'Room ID already exists' });
-    }
-    await pool.query(
-      'INSERT INTO rooms (id, name, password, type) VALUES ($1, $2, $3, $4)',
-      [roomId, roomName, password, 'private']
-    );
-    await pool.query(
-      'INSERT INTO room_participants (room_id, username, deleted) VALUES ($1, $2, false)',
-      [roomId, creator]
-    );
-    res.json({ success: true });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: 'Server error' });
-  }
-});
-
-app.post('/api/rooms/check-password', async (req, res) => {
-  const { roomId, password } = req.body;
-  try {
-    const room = await pool.query('SELECT password FROM rooms WHERE id = $1 AND type = $2', [roomId, 'private']);
-    if (room.rows.length === 0) {
-      return res.status(404).json({ error: 'Room not found' });
-    }
-    if (room.rows[0].password !== password) {
-      return res.status(401).json({ error: 'Invalid password' });
-    }
-    res.json({ success: true });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: 'Server error' });
-  }
-});
-
-app.post('/api/rooms/join', async (req, res) => {
-  const { roomId, username } = req.body;
-  try {
-    await pool.query(
-      `INSERT INTO room_participants (room_id, username, deleted) 
-       VALUES ($1, $2, false)
-       ON CONFLICT (room_id, username) 
-       DO UPDATE SET deleted = false`,
-      [roomId, username]
-    );
-    res.json({ success: true });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: 'Server error' });
-  }
-});
-
-app.post('/api/rooms/rename', async (req, res) => {
-  const { roomId, username, newName } = req.body;
-  if (!roomId || !username || !newName) {
-    return res.status(400).json({ error: 'Missing fields' });
-  }
-  try {
-    const participant = await pool.query(
-      'SELECT * FROM room_participants WHERE room_id = $1 AND username = $2',
-      [roomId, username]
-    );
-    if (participant.rows.length === 0) {
-      return res.status(403).json({ error: 'You are not a participant of this room' });
-    }
-    await pool.query('UPDATE rooms SET name = $1 WHERE id = $2', [newName, roomId]);
-    res.json({ success: true });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: 'Server error' });
-  }
-});
-
-app.post('/api/rooms/delete', async (req, res) => {
-  const { roomId, username } = req.body;
-  try {
-    await pool.query(
-      'UPDATE room_participants SET deleted = true WHERE room_id = $1 AND username = $2',
-      [roomId, username]
-    );
-    const remaining = await pool.query(
-      'SELECT COUNT(*) FROM room_participants WHERE room_id = $1 AND deleted = false',
-      [roomId]
-    );
-    if (parseInt(remaining.rows[0].count) === 0) {
-      await pool.query('DELETE FROM rooms WHERE id = $1', [roomId]);
-    }
-    res.json({ success: true });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: 'Server error' });
-  }
-});
-
-app.get('/api/rooms/list/:username', async (req, res) => {
-  const { username } = req.params;
-  try {
-    const rooms = await pool.query(
-      `SELECT r.id, r.name, r.type 
-       FROM rooms r
-       JOIN room_participants p ON r.id = p.room_id
-       WHERE p.username = $1 AND p.deleted = false AND r.type = 'private'`,
-      [username]
-    );
-    res.json(rooms.rows);
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: 'Server error' });
-  }
-});
-
-app.get('/api/rooms/info/:roomId', async (req, res) => {
-  const { roomId } = req.params;
-  try {
-    const room = await pool.query('SELECT id, name, password FROM rooms WHERE id = $1', [roomId]);
-    if (room.rows.length === 0) {
-      return res.status(404).json({ error: 'Room not found' });
-    }
-    // ⚠️ Отдаём пароль – небезопасно, но требуется клиентом. Можно убрать, если изменить логику на фронте.
-    res.json(room.rows[0]);
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: 'Server error' });
-  }
-});
-
-app.get('/api/rooms/participants/:roomId', async (req, res) => {
-  const { roomId } = req.params;
-  const users = activeUsers.get(roomId);
-  res.json(users ? Array.from(users) : []);
-});
-
-app.get('/api/rooms/participants/public', async (req, res) => {
-  const users = activeUsers.get('public');
-  res.json(users ? Array.from(users) : []);
-});
-
-// ---------- Socket.IO ----------
-io.on('connection', (socket) => {
-  console.log('🔗 Клиент подключился:', socket.id);
-
-  socket.on('joinRoom', async ({ roomId, username }) => {
-    console.log(`📩 joinRoom: ${roomId}, пользователь ${username}`);
+// При открытии профиля другого пользователя
+async function openUserProfile(username) {
+  userProfileName.textContent = username;
+  // Получаем статус и ID
+  const isAdminViewer = currentUserIsAdmin;
+  let userId = null;
+  if (isAdminViewer || username === currentUser.username) {
     try {
-      const room = await pool.query('SELECT id, type FROM rooms WHERE id = $1', [roomId]);
-      if (room.rows.length === 0) {
-        socket.emit('roomError', { message: 'Комната не существует' });
-        return;
-      }
-
-      if (room.rows[0].type === 'private') {
-        const part = await pool.query(
-          'SELECT * FROM room_participants WHERE room_id = $1 AND username = $2',
-          [roomId, username]
-        );
-        if (part.rows.length === 0) {
-          socket.emit('roomError', { message: 'Вы не участник этой комнаты' });
-          return;
-        }
-      }
-
-      socket.join(roomId);
-      socket.data.roomId = roomId;
-      socket.data.username = username;
-
-      if (!activeUsers.has(roomId)) {
-        activeUsers.set(roomId, new Set());
-      }
-      activeUsers.get(roomId).add(username);
-
-      const messages = await pool.query(
-        'SELECT id, sender, text, timestamp FROM messages WHERE room_id = $1 ORDER BY timestamp ASC',
-        [roomId]
-      );
-      socket.emit('roomJoined', {
-        roomId,
-        messages: messages.rows,
-        userCount: activeUsers.get(roomId).size
-      });
-
-      io.to(roomId).emit('userCount', { count: activeUsers.get(roomId).size });
-      console.log(`✅ Пользователь ${username} присоединился к комнате ${roomId}, участников: ${activeUsers.get(roomId).size}`);
-    } catch (err) {
-      console.error('❌ Ошибка joinRoom:', err);
-      socket.emit('roomError', { message: 'Ошибка сервера при подключении' });
-    }
-  });
-
-  socket.on('sendMessage', async ({ roomId, sender, text }) => {
-    console.log(`📩 sendMessage в ${roomId} от ${sender}: ${text.substring(0,30)}...`);
-    try {
-      const result = await pool.query(
-        'INSERT INTO messages (room_id, sender, text) VALUES ($1, $2, $3) RETURNING id',
-        [roomId, sender, text]
-      );
-      const messageId = result.rows[0].id;
-      const newMessage = {
-        id: messageId,
-        roomId,
-        sender,
-        text,
-        timestamp: new Date().toISOString()
-      };
-      io.to(roomId).emit('newMessage', newMessage);
-      console.log(`✅ Сообщение сохранено (id: ${messageId})`);
-    } catch (err) {
-      console.error('❌ Ошибка sendMessage:', err);
-    }
-  });
-
-  socket.on('leaveRoom', ({ roomId }) => {
-    if (roomId && socket.data.username) {
-      console.log(`📩 leaveRoom: ${roomId}, пользователь ${socket.data.username}`);
-      const roomUsers = activeUsers.get(roomId);
-      if (roomUsers) {
-        roomUsers.delete(socket.data.username);
-        if (roomUsers.size === 0) {
-          activeUsers.delete(roomId);
-        } else {
-          io.to(roomId).emit('userCount', { count: roomUsers.size });
-        }
-      }
-      socket.leave(roomId);
-      console.log(`👋 Пользователь ${socket.data.username} покинул комнату ${roomId}`);
-    }
-  });
-
-  socket.on('disconnect', () => {
-    const { roomId, username } = socket.data;
-    if (roomId && username) {
-      console.log(`📩 disconnect: ${roomId}, пользователь ${username}`);
-      const roomUsers = activeUsers.get(roomId);
-      if (roomUsers) {
-        roomUsers.delete(username);
-        if (roomUsers.size === 0) {
-          activeUsers.delete(roomId);
-        } else {
-          io.to(roomId).emit('userCount', { count: roomUsers.size });
-        }
-      }
-    }
-    console.log('🔌 Клиент отключился:', socket.id);
-  });
-});
-
-// ---------- Обработка 404 (всегда JSON) ----------
-app.use((req, res) => {
-  res.status(404).json({ error: 'Not found' });
-});
-
-// ---------- Запуск сервера ----------
-const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => {
-  console.log(`🚀 Сервер запущен на порту ${PORT}`);
-});
+      const res = await fetch(API_BASE + '/api/user/id/' + username + '?requester=' + currentUser.username);
+      const data = await res.json();
+      userId = data.id;
+    } catch {}
+  }
+  // Отображаем ID только для админа или себя
+  const userIdHtml = userId ? `<div><strong>ID:</strong> ${userId}</div>` : '';
+  // ... остальной код
+}
